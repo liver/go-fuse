@@ -38,17 +38,16 @@ const (
 // Server contains the logic for reading from the FUSE device and
 // translating it to RawFileSystem interface calls.
 type Server struct {
+	protocolServer
+
 	// Empty if unmounted.
 	mountPoint string
-	fileSystem RawFileSystem
 
 	// writeMu serializes close and notify writes
 	writeMu sync.Mutex
 
 	// I/O with kernel and daemon.
 	mountFd int
-
-	latencies LatencyMap
 
 	opts *MountOptions
 
@@ -62,22 +61,17 @@ type Server struct {
 	reqPool sync.Pool
 
 	// Pool for raw requests data
-	readPool       sync.Pool
-	reqMu          sync.Mutex
-	reqReaders     int
-	reqInflight    []*request
-	kernelSettings InitIn
-	connectionDead bool
-
-	// in-flight notify-retrieve queries
-	retrieveMu   sync.Mutex
-	retrieveNext uint64
-	retrieveTab  map[uint64]*retrieveCacheRequest // notifyUnique -> retrieve request
+	readPool   sync.Pool
+	reqMu      sync.Mutex
+	reqReaders int
 
 	singleReader bool
 	canSplice    bool
 	loops        sync.WaitGroup
 	serving      bool // for preventing duplicate Serve() calls
+
+	// Used to implement WaitMount on macos.
+	ready chan error
 
 	// for implementing single threaded processing.
 	requestProcessingMu sync.Mutex
@@ -93,9 +87,7 @@ func (ms *Server) SetDebug(dbg bool) {
 // filesystems can adapt to availability of features of the kernel
 // driver. The message should not be altered.
 func (ms *Server) KernelSettings() *InitIn {
-	ms.reqMu.Lock()
 	s := ms.kernelSettings
-	ms.reqMu.Unlock()
 
 	return &s
 }
@@ -153,6 +145,15 @@ func (ms *Server) Unmount() (err error) {
 	return err
 }
 
+// alignSlice ensures that the byte at alignedByte is aligned with the
+// given logical block size.  The input slice should be at least (size
+// + blockSize)
+func alignSlice(buf []byte, alignedByte, blockSize, size uintptr) []byte {
+	misaligned := uintptr(unsafe.Pointer(&buf[alignedByte])) & (blockSize - 1)
+	buf = buf[blockSize-misaligned:]
+	return buf[:size]
+}
+
 // NewServer creates a FUSE server and attaches ("mounts") it to the
 // `mountPoint` directory.
 //
@@ -195,15 +196,21 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 	}
 
 	ms := &Server{
-		fileSystem:   fs,
+		protocolServer: protocolServer{
+			fileSystem:  fs,
+			retrieveTab: make(map[uint64]*retrieveCacheRequest),
+			opts:        &o,
+		},
 		opts:         &o,
 		maxReaders:   maxReaders,
-		retrieveTab:  make(map[uint64]*retrieveCacheRequest),
 		singleReader: useSingleReader,
+		ready:        make(chan error, 1),
 	}
 	ms.reqPool.New = func() interface{} {
-		return &request{
-			cancel: make(chan struct{}),
+		return &requestAlloc{
+			request: request{
+				cancel: make(chan struct{}),
+			},
 		}
 	}
 	ms.readPool.New = func() interface{} {
@@ -211,6 +218,10 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		if targetSize < _FUSE_MIN_READ_BUFFER {
 			targetSize = _FUSE_MIN_READ_BUFFER
 		}
+		// O_DIRECT typically requires buffers aligned to
+		// blocksize (see man 2 open), but requirements vary
+		// across file systems. Presumably, we could also fix
+		// this by reading the requests using readv.
 		buf := make([]byte, targetSize+logicalBlockSize)
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(targetSize))
 		return buf
@@ -223,7 +234,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		}
 		mountPoint = filepath.Clean(filepath.Join(cwd, mountPoint))
 	}
-	fd, err := mount(mountPoint, &o)
+	fd, err := mount(mountPoint, &o, ms.ready)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +323,7 @@ func handleEINTR(fn func() error) (err error) {
 
 // Returns a new request, or error. In case exitIdle is given, returns
 // nil, OK if we have too many readers already.
-func (ms *Server) readRequest(exitIdle bool) (req *request, code Status) {
+func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 	ms.reqMu.Lock()
 	if ms.reqReaders > ms.maxReaders {
 		ms.reqMu.Unlock()
@@ -322,7 +333,7 @@ func (ms *Server) readRequest(exitIdle bool) (req *request, code Status) {
 	ms.reqMu.Unlock()
 
 	reqIface := ms.reqPool.Get()
-	req = reqIface.(*request)
+	req = reqIface.(*requestAlloc)
 	destIface := ms.readPool.Get()
 	dest := destIface.([]byte)
 
@@ -352,8 +363,6 @@ func (ms *Server) readRequest(exitIdle bool) (req *request, code Status) {
 		return nil, EINVAL
 	}
 
-	req.inflightIndex = len(ms.reqInflight)
-	ms.reqInflight = append(ms.reqInflight, req)
 	if !gobbled {
 		ms.readPool.Put(destIface)
 	}
@@ -367,31 +376,17 @@ func (ms *Server) readRequest(exitIdle bool) (req *request, code Status) {
 }
 
 // returnRequest returns a request to the pool of unused requests.
-func (ms *Server) returnRequest(req *request) {
-	ms.reqMu.Lock()
-	this := req.inflightIndex
-	last := len(ms.reqInflight) - 1
-
-	if last != this {
-		ms.reqInflight[this] = ms.reqInflight[last]
-		ms.reqInflight[this].inflightIndex = this
-	}
-	ms.reqInflight = ms.reqInflight[:last]
-	interrupted := req.interrupted
-	ms.reqMu.Unlock()
-
-	ms.recordStats(req)
-	if interrupted {
-		// Don't reposses data, because someone might still
-		// be looking at it
-		return
-	}
+func (ms *Server) returnRequest(req *requestAlloc) {
+	ms.recordStats(&req.request)
 
 	if req.bufferPoolOutputBuf != nil {
 		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
 		req.bufferPoolOutputBuf = nil
 	}
-
+	if req.interrupted {
+		req.interrupted = false
+		req.cancel = make(chan struct{}, 0)
+	}
 	req.clear()
 
 	if p := req.bufferPoolInputBuf; p != nil {
@@ -469,6 +464,10 @@ func (ms *Server) handleInit() Status {
 		return code
 	}
 
+	if ms.kernelSettings.Minor >= 13 {
+		ms.setSplice()
+	}
+
 	// INIT is handled. Init the file system, but don't accept
 	// incoming requests, so the file system can setup itself.
 	ms.fileSystem.Init(ms)
@@ -536,46 +535,32 @@ exit:
 	}
 }
 
-func (ms *Server) cancelAll() {
-	ms.reqMu.Lock()
-	defer ms.reqMu.Unlock()
-	ms.connectionDead = true
-	for _, req := range ms.reqInflight {
-		if !req.interrupted {
-			close(req.cancel)
-			req.interrupted = true
-		}
-	}
-	// Leave ms.reqInflight alone, or returnRequest will barf.
-}
-
-func (ms *Server) handleRequest(req *request) Status {
+func (ms *Server) handleRequest(req *requestAlloc) Status {
+	defer ms.returnRequest(req)
 	if ms.opts.SingleThreaded {
 		ms.requestProcessingMu.Lock()
 		defer ms.requestProcessingMu.Unlock()
 	}
 
-	req.parse(&ms.kernelSettings)
-	if req.handler == nil {
-		req.status = ENOSYS
+	h, inSize, outSize, outPayloadSize, code := parseRequest(req.inputBuf, &ms.kernelSettings)
+	if !code.Ok() {
+		ms.opts.Logger.Printf("parseRequest: %v", code)
+		return code
 	}
 
-	if req.status.Ok() && ms.opts.Debug {
-		ms.opts.Logger.Println(req.InputDebug())
+	req.inPayload = req.inputBuf[inSize:]
+	req.inputBuf = req.inputBuf[:inSize]
+	req.outputBuf = req.outBuf[:outSize+int(sizeOfOutHeader)]
+	copy(req.outputBuf, zeroOutBuf[:])
+	if outPayloadSize > 0 {
+		req.outPayload = ms.buffers.AllocBuffer(uint32(outPayloadSize))
 	}
-
-	if req.inHeader().NodeId == pollHackInode ||
-		req.inHeader().NodeId == FUSE_ROOT_ID && len(req.filenames) > 0 && req.filenames[0] == pollHackName {
-		doPollHackLookup(ms, req)
-	} else if req.status.Ok() && req.handler.Func == nil {
-		ms.opts.Logger.Printf("Unimplemented opcode %v", operationName(req.inHeader().Opcode))
-		req.status = ENOSYS
-	} else if req.status.Ok() {
-		req.handler.Func(ms, req)
+	ms.protocolServer.handleRequest(h, &req.request)
+	if req.suppressReply {
+		return OK
 	}
-
-	errNo := ms.write(req)
-	if errNo != 0 {
+	errno := ms.write(&req.request)
+	if errno != 0 {
 		// Ignore ENOENT for INTERRUPT responses which
 		// indicates that the referred request is no longer
 		// known by the kernel. This is a normal if the
@@ -587,75 +572,39 @@ func (ms *Server) handleRequest(req *request) Status {
 		// RELEASE. This is because RELEASE is analogous to
 		// FORGET, and is not synchronized with the calling
 		// process, but does require a response.
-		if ms.opts.Debug || !(errNo == ENOENT && (req.inHeader().Opcode == _OP_INTERRUPT ||
+		if ms.opts.Debug || !(errno == ENOENT && (req.inHeader().Opcode == _OP_INTERRUPT ||
+			req.inHeader().Opcode == _OP_RELEASEDIR ||
 			req.inHeader().Opcode == _OP_RELEASE)) {
 			ms.opts.Logger.Printf("writer: Write/Writev failed, err: %v. opcode: %v",
-				errNo, operationName(req.inHeader().Opcode))
+				errno, operationName(req.inHeader().Opcode))
 		}
 	}
-	ms.returnRequest(req)
-	return Status(errNo)
+	return errno
 }
 
-// alignSlice ensures that the byte at alignedByte is aligned with the
-// given logical block size.  The input slice should be at least (size
-// + blockSize)
-func alignSlice(buf []byte, alignedByte, blockSize, size uintptr) []byte {
-	misaligned := uintptr(unsafe.Pointer(&buf[alignedByte])) & (blockSize - 1)
-	buf = buf[blockSize-misaligned:]
-	return buf[:size]
-}
+func (ms *Server) notifyWrite(req *request) Status {
+	req.serializeHeader(req.outPayloadSize())
 
-func (ms *Server) allocOut(req *request, size uint32) []byte {
-	if cap(req.bufferPoolOutputBuf) >= int(size) {
-		req.bufferPoolOutputBuf = req.bufferPoolOutputBuf[:size]
-		return req.bufferPoolOutputBuf
-	}
-	if req.bufferPoolOutputBuf != nil {
-		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
-		req.bufferPoolOutputBuf = nil
-	}
-	// As this allocated a multiple of the page size, very likely
-	// this is aligned to logicalBlockSize too, which is smaller.
-	req.bufferPoolOutputBuf = ms.buffers.AllocBuffer(size)
-	return req.bufferPoolOutputBuf
-}
-
-func (ms *Server) write(req *request) Status {
-	// Forget/NotifyReply do not wait for reply from filesystem server.
-	switch req.inHeader().Opcode {
-	case _OP_FORGET, _OP_BATCH_FORGET, _OP_NOTIFY_REPLY:
-		return OK
-	case _OP_INTERRUPT:
-		if req.status.Ok() {
-			return OK
-		}
-	}
-	if req.status == EINTR {
-		ms.reqMu.Lock()
-		dead := ms.connectionDead
-		ms.reqMu.Unlock()
-		if dead {
-			return OK
-		}
-	}
-	header := req.serializeHeader(req.flatDataSize())
 	if ms.opts.Debug {
 		ms.opts.Logger.Println(req.OutputDebug())
 	}
 
-	if header == nil {
-		return OK
-	}
+	// Protect against concurrent close.
+	ms.writeMu.Lock()
+	result := ms.write(req)
+	ms.writeMu.Unlock()
 
-	s := ms.systemWrite(req, header)
-	return s
+	if ms.opts.Debug {
+		h := getHandler(req.inHeader().Opcode)
+		ms.opts.Logger.Printf("Response %s: %v", h.Name, result)
+	}
+	return result
 }
 
 func newNotifyRequest(opcode uint32) *request {
 	r := &request{
-		inputBuf: make([]byte, unsafe.Sizeof(InHeader{})),
-		handler:  operationHandlers[opcode],
+		inputBuf:  make([]byte, unsafe.Sizeof(InHeader{})),
+		outputBuf: make([]byte, sizeOfOutHeader+getHandler(opcode).OutputSize),
 		status: map[uint32]Status{
 			_OP_NOTIFY_INVAL_INODE:    NOTIFY_INVAL_INODE,
 			_OP_NOTIFY_INVAL_ENTRY:    NOTIFY_INVAL_ENTRY,
@@ -682,15 +631,7 @@ func (ms *Server) InodeNotify(node uint64, off int64, length int64) Status {
 	entry.Off = off
 	entry.Length = length
 
-	// Protect against concurrent close.
-	ms.writeMu.Lock()
-	result := ms.write(req)
-	ms.writeMu.Unlock()
-
-	if ms.opts.Debug {
-		ms.opts.Logger.Println("Response: INODE_NOTIFY", result)
-	}
-	return result
+	return ms.notifyWrite(req)
 }
 
 // InodeNotifyStoreCache tells kernel to store data into inode's cache.
@@ -733,17 +674,9 @@ func (ms *Server) inodeNotifyStoreCache32(node uint64, offset int64, data []byte
 	store.Offset = uint64(offset) // NOTE not int64, as it is e.g. in NotifyInvalInodeOut
 	store.Size = uint32(len(data))
 
-	req.flatData = data
+	req.outPayload = data
 
-	// Protect against concurrent close.
-	ms.writeMu.Lock()
-	result := ms.write(req)
-	ms.writeMu.Unlock()
-
-	if ms.opts.Debug {
-		ms.opts.Logger.Printf("Response: INODE_NOTIFY_STORE_CACHE: %v", result)
-	}
-	return result
+	return ms.notifyWrite(req)
 }
 
 // InodeRetrieveCache retrieves data from kernel's inode cache.
@@ -822,13 +755,7 @@ func (ms *Server) inodeRetrieveCache1(node uint64, offset int64, dest []byte) (n
 	ms.retrieveMu.Unlock()
 
 	// Protect against concurrent close.
-	ms.writeMu.Lock()
-	result := ms.write(req)
-	ms.writeMu.Unlock()
-
-	if ms.opts.Debug {
-		ms.opts.Logger.Printf("Response: NOTIFY_RETRIEVE_CACHE: %v", result)
-	}
+	result := ms.notifyWrite(req)
 	if result != OK {
 		ms.retrieveMu.Lock()
 		r := ms.retrieveTab[q.NotifyUnique]
@@ -888,17 +815,9 @@ func (ms *Server) DeleteNotify(parent uint64, child uint64, name string) Status 
 	nameBytes := make([]byte, len(name)+1)
 	copy(nameBytes, name)
 	nameBytes[len(nameBytes)-1] = '\000'
-	req.flatData = nameBytes
+	req.outPayload = nameBytes
 
-	// Protect against concurrent close.
-	ms.writeMu.Lock()
-	result := ms.write(req)
-	ms.writeMu.Unlock()
-
-	if ms.opts.Debug {
-		ms.opts.Logger.Printf("Response: DELETE_NOTIFY: %v", result)
-	}
-	return result
+	return ms.notifyWrite(req)
 }
 
 // EntryNotify should be used if the existence status of an entry
@@ -918,17 +837,9 @@ func (ms *Server) EntryNotify(parent uint64, name string) Status {
 	nameBytes := make([]byte, len(name)+1)
 	copy(nameBytes, name)
 	nameBytes[len(nameBytes)-1] = '\000'
-	req.flatData = nameBytes
+	req.outPayload = nameBytes
 
-	// Protect against concurrent close.
-	ms.writeMu.Lock()
-	result := ms.write(req)
-	ms.writeMu.Unlock()
-
-	if ms.opts.Debug {
-		ms.opts.Logger.Printf("Response: ENTRY_NOTIFY: %v", result)
-	}
-	return result
+	return ms.notifyWrite(req)
 }
 
 // SupportsVersion returns true if the kernel supports the given
@@ -963,6 +874,10 @@ func (in *InitIn) supportsRenameSwap() bool {
 // avoid racing between accessing the (empty or not yet mounted)
 // mountpoint, and the OS trying to setup the user-space mount.
 func (ms *Server) WaitMount() error {
+	err := <-ms.ready
+	if err != nil {
+		return err
+	}
 	if parseFuseFd(ms.mountPoint) >= 0 {
 		// Magic `/dev/fd/N` mountpoint. We don't know the real mountpoint, so
 		// we cannot run the poll hack.

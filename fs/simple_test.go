@@ -61,6 +61,7 @@ type testOptions struct {
 	ro                bool
 	directMount       bool // sets MountOptions.DirectMount
 	directMountStrict bool // sets MountOptions.DirectMountStrict
+	disableSplice     bool // sets MountOptions.DisableSplice
 }
 
 // newTestCase creates the directories `orig` and `mnt` inside a temporary
@@ -111,6 +112,7 @@ func newTestCase(t *testing.T, opts *testOptions) *testCase {
 		DirectMount:       opts.directMount,
 		DirectMountStrict: opts.directMountStrict,
 		EnableLocks:       opts.enableLocks,
+		DisableSplice:     opts.disableSplice,
 	}
 	if !opts.suppressDebug {
 		mOpts.Debug = testutil.VerboseTest()
@@ -388,6 +390,14 @@ func TestPosix(t *testing.T) {
 			fn(t, tc.mntDir)
 		})
 	}
+}
+
+func TestReadDisableSplice(t *testing.T) {
+	tc := newTestCase(t, &testOptions{
+		disableSplice: true,
+	})
+
+	posixtest.FileBasic(t, tc.mntDir)
 }
 
 func TestOpenDirectIO(t *testing.T) {
@@ -733,4 +743,28 @@ func TestParallelMount(t *testing.T) {
 			t.Error(e)
 		}
 	}
+}
+
+type handleLessCreateNode struct {
+	Inode
+}
+
+var _ = (NodeCreater)((*handleLessCreateNode)(nil))
+
+func (n *handleLessCreateNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *Inode, fh FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	f := &MemRegularFile{
+		Attr: fuse.Attr{
+			Mode: mode,
+		},
+	}
+	ch := n.NewPersistentInode(ctx, f, StableAttr{Mode: fuse.S_IFREG})
+	n.AddChild(name, ch, true)
+	return ch, nil, fuse.FOPEN_KEEP_CACHE, 0
+}
+
+func TestHandleLessCreate(t *testing.T) {
+	hlcn := &handleLessCreateNode{}
+	dir, _ := testMount(t, hlcn, nil)
+
+	posixtest.FileBasic(t, dir)
 }
